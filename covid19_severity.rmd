@@ -1,0 +1,300 @@
+---
+title: "COVID-19 severity"
+author: "Mark Jit"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r set global options, include = FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F,
+                      fig.width = 10, fig.height = 6, dpi = 80)
+```
+
+```{r libraries}
+require(dplyr)
+require(magrittr)
+require(PropCIs)
+```
+
+## Data
+
+```{r data}
+
+## Verity et al. medRxiv (China; based on Yang et al. withdrawn paper) https://doi.org/10.1101/2020.03.09.20033357 
+infect_hosp=list(
+  age = c(0,10,20,30,40,50,60,70,80),
+  n = c(13,50,437,733,743,790,560,263,76),
+  prop = c(0,0.04,1.1,3.4,4.3,8.2,11.8,16.6,18.4)/100
+)
+infect_hosp$p <- with(infect_hosp, n * prop) %>% round
+infect_hosp$age_mp <- mapply(function(x,y) (x+y)/2, 
+                             infect_hosp$age, c(infect_hosp$age[-1],100))
+
+## CDC COVID-19 Response Team. MMWR 2020; 69:1-4. http://dx.doi.org/10.15585/mmwr.mm6912e2
+reported_hosp=list(
+  age = c(0,20,45,55,65,75,85),
+  n = c(123,705,429,429,409,210,144),
+  prop_l = c(1.6,14.3,21.2,20.5,28.6,30.5,31.3)/100,
+  prop_h = c(2.5,20.8,28.3,30.1,43.5,58.7,70.3)/100
+)
+reported_hosp$p_l <- with(reported_hosp, n * prop_l) %>% round
+reported_hosp$p_h <- with(reported_hosp, n * prop_h) %>% round
+reported_hosp$age_mp <- mapply(function(x,y) (x+y)/2, 
+                              reported_hosp$age, c(reported_hosp$age[-1],100))
+
+reported_icu=list(
+  age=c(0,20,45,55,65,75,85),
+  n=c(123,705,429,429,409,210,144),
+  prop_l=c(0,2.0,5.4,4.7,8.1,10.5,6.3)/100,
+  prop_h=c(0,4.2,10.4,11.2,18.8,31.0,29.0)/100
+)
+reported_icu$p_l <- with(reported_icu, n * prop_l) %>% round
+reported_icu$p_h <- with(reported_icu, n * prop_h) %>% round
+reported_icu$age_mp <- mapply(function(x,y) (x+y)/2, 
+                              reported_icu$age, c(reported_icu$age[-1],100))
+
+reported_die=list(
+  age=c(0,20,45,55,65,75,85),
+  n=c(123,705,429,429,409,210,144),
+  prop_l=c(0,0.1,0.5,1.4,2.7,4.3,10.4)/100,
+  prop_h=c(0.0,0.2,0.8,2.6,4.9,10.5,27.3)/100
+)
+reported_die$p_l <- with(reported_die, n * prop_l) %>% round
+reported_die$p_h <- with(reported_die, n * prop_h) %>% round
+reported_die$age_mp <- mapply(function(x,y) (x+y)/2, 
+                              reported_die$age, c(reported_die$age[-1],100))
+
+```
+
+## Fit functions by importance sampling
+
+```{r fit_functions}
+events_lin <- function(obs_ages, A, B) A + obs_ages * B #linear
+events_exp <- function(obs_ages, A, B) A * exp(B * obs_ages) #exponential
+events_log <- function(obs_ages, A, B, C) A/(1+exp(-B*(obs_ages-C))) #logistic
+
+NLL <- function(obs_p, obs_n, exp_p){
+  ifelse(exp_p %>% max > 1,
+         10^10,
+         dbinom(x = obs_p, size = obs_n, prob = exp_p) %>% prod %>% log %>% multiply_by(-2)
+  )
+}
+
+montecarlo <- function(obs_ages_mp, obs_p, obs_n, type="linear", 
+                       rmax = list(A=1, B=1, C=100)){
+
+  nsamples <- 100000
+  mc <- list()
+  mc$type <- type
+  mc$A <- runif(nsamples, min=0, max=rmax$A)
+  mc$B <- runif(nsamples, min=0, max=rmax$B)
+  mc$C <- runif(nsamples, min=0, max=rmax$C)
+  
+  #Generate values for interpolating function
+  if(type == "linear"){
+    mc$model <- cbind(mc$A, mc$B) %>% 
+      apply(., 1, function(x) events_lin(obs_ages_mp, x[[1]], x[[2]]))
+    mc$model_prop <- cbind(mc$A, mc$B) %>% 
+      apply(., 1, function(x) events_lin(0:100, x[[1]], x[[2]]))
+  }
+  if(type == "exp"){
+    mc$model <- cbind(mc$A, mc$B) %>% 
+      apply(., 1, function(x) events_exp(obs_ages_mp, x[[1]], x[[2]]))
+    mc$model_prop <- cbind(mc$A, mc$B) %>% 
+      apply(., 1, function(x) events_exp(0:100, x[[1]], x[[2]]))
+  }
+  if(type == "log"){
+    mc$model <- cbind(mc$A, mc$B, mc$C) %>% 
+      apply(., 1, function(x) events_log(obs_ages_mp, x[[1]], x[[2]], x[[3]]))
+    mc$model_prop <- cbind(mc$A, mc$B, mc$C) %>% 
+      apply(., 1, function(x) events_log(0:100, x[[1]], x[[2]], x[[3]]))
+  }
+  mc$NLL <- mc$model %>% apply(., 2, function (x) NLL(obs_p, obs_n, x))
+  mc$MLE <- mc$NLL %>% which.min
+  mc$ISR <- sample.int(nsamples, size=1000, replace=T, prob = exp(-mc$NLL))
+
+  return(mc)
+}
+
+#Monte Carlo twice - once to establish range to sample from
+mc_twice <- function(obs_ages_mp, obs_p, obs_n, type="linear"){
+
+  if(type == "linear") mc_once <- montecarlo(
+    obs_ages_mp, obs_p, obs_n, type="linear", rmax=list(A = 1, B = 0.1, C = 100))
+  if(type == "exp") mc_once <- montecarlo(
+    obs_ages_mp, obs_p, obs_n, type="exp", rmax=list(A = 0.1, B = 0.05, C = 100))
+  if(type == "log") mc_once <- montecarlo(
+    obs_ages_mp, obs_p, obs_n, type="log", rmax=list(A = 1, B = 1, C = 100))
+  rmax_once <- list(
+    A = mc_once$A[mc_once$ISR] %>% max %>% multiply_by(2),
+    B = mc_once$B[mc_once$ISR] %>% max %>% multiply_by(2),
+    C = mc_once$C[mc_once$ISR] %>% max %>% multiply_by(2)
+  )
+  mc_twice <- montecarlo(obs_ages_mp, obs_p, obs_n, type=type, rmax = rmax_once)
+}
+
+```
+
+```{r plot functions}
+
+alpha <- function(col, alpha) 
+  rgb(col2rgb(col)[1], col2rgb(col)[2], col2rgb(col)[3], 
+      maxColorValue = 255, alpha = alpha*255)
+
+f_graph = function(data_age, data_p, data_n, model_prop, ylab){
+  
+  cis <- mapply(function (p,n) exactci(p, n, conf.level=0.95)$conf.int, data_p, data_n)
+  ymax <- max(model_prop, cis[2,])
+  plot(x = data_age, y = data_p/data_n, 
+     pch = 18, col = "red", ylim = c(0,ymax),
+     xlab = "Age (years)", ylab = ylab)
+  
+  model_prop_u <- model_prop %>% apply(1,function(x) quantile(x, c(0.975)))
+  model_prop_l <- model_prop %>% apply(1,function(x) quantile(x, c(0.025)))
+  
+  polygon(x = c(0:100, rev(0:100)), 
+          y = c(model_prop_l, rev(model_prop_u)), 
+          col = alpha("gray", alpha=0.3), border = NA)
+  arrows(x0=data_age, x1=data_age, y0=cis[1,], y1=cis[2,], length=0, col="red")
+  
+  legend("topleft", legend = c("Data (mean, Clopper-Pearson exact 95% CI)","Model (95% CrI)"),
+         col=c("red", col = alpha("gray", alpha=0.3)), lwd=c(1,10), pch=c(18,NA), bty="n")
+  
+  }
+```
+
+## Show fit to proportion of infected cases that are hospitalised (Verity et al.) and plot
+
+```{r fit_infect_hosp}
+#Pick function based on likelihood
+mc_infect_hosp_exp <- mc_twice(infect_hosp$age_mp, infect_hosp$p, infect_hosp$n, type="exp")
+mc_infect_hosp_linear <- mc_twice(infect_hosp$age_mp, infect_hosp$p, infect_hosp$n, type="linear")
+mc_infect_hosp_log <- mc_twice(infect_hosp$age_mp, infect_hosp$p, infect_hosp$n, type="log")
+mc_infect_hosp_linear$NLL[mc_infect_hosp_linear$MLE] + 2*2
+mc_infect_hosp_exp$NLL[mc_infect_hosp_exp$MLE] + 2*2
+mc_infect_hosp_log$NLL[mc_infect_hosp_log$MLE] + 2*3
+mc_infect_hosp <- mc_infect_hosp_log
+f_graph(data_age = infect_hosp$age_mp, data_p = infect_hosp$p, data_n = infect_hosp$n,
+        model_prop = mc_infect_hosp$model_prop[,mc_infect_hosp$ISR], 
+        ylab = "Prop of infected cases that are hospitalised")
+```
+
+## Show fit to proportion of reported cases that are hospitalised (CDC) and plot
+
+```{r fit_reported_hosp}
+layout(matrix(c(1,2), 2, 1))
+par(mar=c(4,5,0,0)+0.1)
+par(mgp=c(2,1,0))
+mc_case_hosp_l_linear <- mc_twice(reported_hosp$age_mp, reported_hosp$p_l, reported_hosp$n, 
+                        type="linear")
+mc_case_hosp_l_exp <- mc_twice(reported_hosp$age_mp, reported_hosp$p_l, reported_hosp$n, 
+                        type="exp")
+mc_case_hosp_l_log <- mc_twice(reported_hosp$age_mp, reported_hosp$p_l, reported_hosp$n, 
+                        type="log")
+mc_case_hosp_l_linear$NLL[mc_case_hosp_l_linear$MLE] + 2*2
+mc_case_hosp_l_exp$NLL[mc_case_hosp_l_exp$MLE] + 2*2
+mc_case_hosp_l_log$NLL[mc_case_hosp_l_log$MLE] + 2*3
+mc_case_hosp_l <- mc_case_hosp_l_linear
+f_graph(data_age = reported_hosp$age_mp, data_p = reported_hosp$p_l, data_n = reported_hosp$n,
+        model_prop = mc_case_hosp_l$model_prop[,mc_case_hosp_l$ISR], 
+        ylab = "Prop of cases\nhospitalised (low)")
+
+mc_case_hosp_h_linear <- mc_twice(reported_hosp$age_mp, reported_hosp$p_h, reported_hosp$n,
+                        type="linear")
+mc_case_hosp_h_exp <- mc_twice(reported_hosp$age_mp, reported_hosp$p_h, reported_hosp$n,
+                        type="exp")
+mc_case_hosp_h_log <- mc_twice(reported_hosp$age_mp, reported_hosp$p_h, reported_hosp$n,
+                        type="log")
+mc_case_hosp_h_linear$NLL[mc_case_hosp_h_linear$MLE] + 2*2
+mc_case_hosp_h_exp$NLL[mc_case_hosp_h_exp$MLE] + 2*2
+mc_case_hosp_h_log$NLL[mc_case_hosp_h_log$MLE] + 2*3
+mc_case_hosp_h <- mc_case_hosp_h_exp
+f_graph(data_age = reported_hosp$age_mp, data_p = reported_hosp$p_h, data_n = reported_hosp$n,
+        model_prop = mc_case_hosp_h$model_prop[,mc_case_hosp_h$ISR], 
+        ylab = "Prop of cases\nhospitalised (high)")
+
+```
+
+## Show fit to proportion of reported cases that are admitted to ICU (CDC) and plot
+
+```{r fit_reported_icu}
+#Pick a linear function by eyeballing data
+
+layout(matrix(c(1,2), 2, 1))
+par(mar=c(4,5,0,0)+0.1)
+par(mgp=c(2,1,0))
+mc_case_icu_l_linear <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="linear")
+mc_case_icu_l_exp <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="exp")
+mc_case_icu_l_log <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="log")
+mc_case_icu_l_linear$NLL[1] + 2*2
+mc_case_icu_l_exp$NLL[1] + 2*2
+mc_case_icu_l_log$NLL[1] + 2*3
+mc_case_icu_l <- mc_case_icu_l_linear
+f_graph(data_age = reported_icu$age_mp, data_p = reported_icu$p_l, data_n = reported_icu$n,
+        model_prop = mc_case_icu_l$model_prop[,mc_case_icu_l$ISR], 
+        ylab = "Prop of cases\nin ICU (low)")
+
+mc_case_icu_h_linear <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="linear")
+mc_case_icu_h_exp <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="exp")
+mc_case_icu_h_log <- mc_twice(reported_icu$age_mp, reported_icu$p_l, reported_icu$n, 
+                        type="log")
+mc_case_icu_h_linear$NLL[1] + 2*2
+mc_case_icu_h_exp$NLL[1] + 2*2
+mc_case_icu_h_log$NLL[1] + 2*3
+mc_case_icu_h <- mc_case_icu_h_linear
+f_graph(data_age = reported_icu$age_mp, data_p = reported_icu$p_l, data_n = reported_icu$n,
+        model_prop = mc_case_icu_h$model_prop[,mc_case_icu_h$ISR], 
+        ylab = "Prop of cases\nin ICU (high)")
+
+```
+
+## Estimate proportion of infected people who are admitted to ICU
+
+```{r ratios}
+
+mc_infect_icu_l <- mc_infect_hosp$model_prop[,mc_infect_hosp$ISR] *
+  mc_case_icu_l$model_prop[,mc_case_icu_l$ISR] /
+  mc_case_hosp_l$model_prop[,mc_case_hosp_l$ISR]
+mc_infect_icu_h <- mc_infect_hosp$model_prop[,mc_infect_hosp$ISR] *
+  mc_case_icu_h$model_prop[,mc_case_icu_h$ISR] /
+  mc_case_hosp_h$model_prop[,mc_case_hosp_h$ISR]
+
+layout(matrix(c(1,2), 2, 1))
+par(mar=c(4,5,0,0)+0.1)
+par(mgp=c(2,1,0))
+
+mc_infect_icu_l_u95 <- mc_infect_icu_l %>% apply(1,function(x) quantile(x, c(0.975)))
+mc_infect_icu_l_l95 <- mc_infect_icu_l %>% apply(1,function(x) quantile(x, c(0.025)))
+mc_infect_icu_l %>% 
+  apply(1, median) %>% 
+  plot(x = 0:100, y = ., type="l", 
+       ylim = c(0,mc_infect_icu_l_u95 %>% max),
+       xlab = "Age (years)", ylab = "Prop of infecteds\nin ICU (low)")
+polygon(x = c(0:100, rev(0:100)), 
+        y = c(mc_infect_icu_l_u95, rev(mc_infect_icu_l_l95)), 
+        col = alpha("gray", alpha=0.3), border = NA)
+
+mc_infect_icu_h_u95 <- mc_infect_icu_h %>% apply(1,function(x) quantile(x, c(0.975)))
+mc_infect_icu_h_l95 <- mc_infect_icu_h %>% apply(1,function(x) quantile(x, c(0.025)))
+mc_infect_icu_h %>% 
+  apply(1, median) %>% 
+  plot(x = 0:100, y = ., type="l", 
+       ylim = c(0,mc_infect_icu_h_u95 %>% max),
+       xlab = "Age (years)", ylab = "Prop of infecteds\nin ICU (high)")
+polygon(x = c(0:100, rev(0:100)), 
+        y = c(mc_infect_icu_h_u95, rev(mc_infect_icu_h_l95)), 
+        col = alpha("gray", alpha=0.3), border = NA)
+
+```
+
+```{r write_to_Rds_file}
+
+mc_infect_icu <- list(low = mc_infect_icu_l, high = mc_infect_icu_h)
+#saveRDS(mc_infect_icu, here::here("data", "rds", "infect_to_ICU.rds"))
+
+```

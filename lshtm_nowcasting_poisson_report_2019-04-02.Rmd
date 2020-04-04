@@ -1,0 +1,730 @@
+---
+title: "LSHTM nowcasting UK report (Poisson model)"
+author: "Mark, Thibaut, Emily, CMMID, John"
+date: "`r format(Sys.time(), '%A %d %B %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    highlight: zenburn
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+    toc_collapse: no
+    toc_depth: 4
+    toc_float: yes
+    css: !expr here::here('css', 'style.css')
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      collapse = TRUE,
+                      fig.width = 8,
+                      fig.height = 6,
+                      dpi = 80,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+# Data preparation {.tabset .tabset-fade .tabset-pills}
+
+## Outline
+
+
+* **Load scripts**: loads libraries and useful scripts used in the analyses; all
+`.R` files contained in `scripts` at the root of the factory are automatically
+loaded
+
+* **Load data**: imports datasets, and may contain some *ad hoc* changes to the
+data such as specific data cleaning (not used in other reports), new variables
+used in the analyses, etc.
+
+## Load packages
+
+```{r libraries}
+
+rm(sporadic, prop_icu, ff100.icu, mult_ff100, mult, london, today, start_date, t_range, t_range_all, gpicu_table, gp_table, icu_table, gp_lon_table, icu_lon_table, lambda, NLL, ISR_montecarlo, predicted_cases, graph)
+options(scipen=10)		#supress scientific notation; normally 0
+library(reportfactory)
+library(tidyverse)
+library(incidence)
+library(projections)
+library(linelist)
+library(cyphr)
+library(lhs)
+library(qwraps2)
+
+```
+
+## Load scripts
+
+These scripts will load:
+
+* all local scripts, stored as `.R` filesinside `/scripts/`
+* all global scripts, i.e. stored outside the factory in `../scripts/`
+
+```{r load_scripts}
+
+rfh_load_scripts()
+
+```
+
+
+## Load clean data
+
+The latest clean FF100 data is automatically detected and read:
+
+```{r load_ff100}
+
+current_clean_ff100
+ff100 <- import_clean_ff100()
+
+```
+
+The latest clean CHESS data is automatically detected and read:
+
+```{r load_chess}
+
+current_clean_chess
+chess <- import_clean_chess()
+
+```
+
+Colours
+
+```{r mycolours}
+#Thibaut recommended colours to assist colour-blindness
+my_green <- "#67BBA6"
+my_red   <- "#BA5564"
+my_blue  <- "#6D89A1"
+my_green_t <- alpha(my_green, alpha = 0.3)
+my_red_t   <- alpha(my_red, alpha = 0.3)
+grey_t <- alpha("grey", alpha = 0.3)
+```
+
+## The delay distribution from FF100 data is calculated then fitted by importance resampling
+
+```{r fit_delay}
+
+discgamma <- function(day, shape=7, scale=1) pgamma(day+1, shape, scale) - pgamma(day, shape, scale)
+  
+montecarlo_delay <- function(obs_days){
+
+  nsamples <- 10000
+  mc <- list()
+  mc$A <- runif(nsamples, min=0, max=10)    
+  mc$B <- runif(nsamples, min=0, max=10)
+  mc$model <- cbind(mc$A, mc$B) %>%
+    apply(., 1, function(x) discgamma(0:max(obs_days), x[[1]], x[[2]]))
+  mc$NLL <- cbind(mc$A, mc$B) %>% 
+      apply(., 1, function(x){
+        discgamma(obs_days, x[[1]], x[[2]]) %>% 
+          prod %>% log %>% multiply_by(-2)
+      })
+
+  mc$A <- mc$A[order(mc$NLL)]
+  mc$B <- mc$B[order(mc$NLL)]
+  mc$model <- mc$model[,order(mc$NLL)]
+  mc$NLL <- mc$NLL[order(mc$NLL)]
+ 
+  mc$ISR <- sample.int(nsamples, size=nsamples/10, replace=T, prob = exp(-mc$NLL))
+  return(mc)
+}
+
+delay <- 
+  ff100 %>%
+  mutate(days = as.integer(difftime(date_reported, date_onset, units = "days"))) %>%
+  filter(case_classification == "sporadic",
+         # !is.na(date_admission), # with this condition, n = 54
+         !is.na(days),
+         days >= 0) %>%
+  select(days)
+
+delay_dist <- delay %>%
+  group_by(days) %>%
+  summarise(n = n()) %>%
+  complete(days = 0:max(days), fill = list(n = 0)) %>%
+  mutate(prob = n/sum(n))
+
+# Summarise
+sum(delay_dist$n) #number of entries
+rep(delay_dist$days, delay_dist$n) %>% quantile(c(0.025, 0.25, 0.5, 0.75, 0.975)) #quantiles
+
+#Fit gamma
+MC_delay <- montecarlo_delay(obs_days = delay$days)
+ndelay <- MC_delay$ISR %>% length
+
+sum(delay_dist$n) #number of entries
+rep(delay_dist$days, delay_dist$n) %>% quantile(c(0.025, 0.25, 0.5, 0.75, 0.975)) #quantiles
+bp <- barplot(names.arg = delay_dist$days, height = delay_dist$prob, col = my_red,
+        xlab = "Duration of delay (days)", ylab="Probability")
+box()
+model_delay_u <- MC_delay$model[,MC_delay$ISR] %>% apply(1,function(x) quantile(x, c(0.975)))
+model_delay_l <- MC_delay$model[,MC_delay$ISR] %>% apply(1,function(x) quantile(x, c(0.0255)))
+polygon(x = c(bp[,1], rev(bp[,1])), 
+        y = c(model_delay_l, rev(model_delay_u)), 
+        col = alpha("gray", alpha=0.5), border = NA)
+```
+
+The risk of being admitted to ICU per infected patient is read from an .rds file
+
+```{r load_infect_to_ICU}
+
+infect_to_icu <- here::here("data", "rds", "infect_to_icu.rds") %>% readRDS 
+
+```
+
+
+## Completion date
+
+We extract the completion date from the file name:
+
+```{r ff100_date}
+
+file_name <- extract_file_name(current_clean_ff100)
+ff100_date <- file_name %>%
+  guess_dates()
+ff100_date
+
+```
+
+# Poisson model {.tabset .tabset-fade .tabset-pills}
+
+Infers the number of symptomatic cases by fitting a Poisson model (with time-dependent lambda based on exponential growth) to ICU cases from FF100 and CHESS.
+
+## Check how many FF100 cases went to ICU
+
+```{r icu_stats}
+ff100 %>% filter(icu_adm!=0) %>% group_by(case_classification) %>% summarise(n = n())
+```
+
+## Estimating parameters including multipliers
+
+```{r extract_data}
+
+## Extract sporadic cases
+## Mark as "GP" cases that have no hospital admission date and are alive (may be RCGP)
+
+sporadic <- ff100 %>%
+  filter(case_classification=="sporadic") %>%
+  select(age, date_onset, date_reported, hospitalised, status, local_authority) %>%
+  mutate(gp = !hospitalised & status == "alive") %>%
+  mutate(date_onset2 = if_else(is.na(date_onset), date_reported, date_onset))
+
+## Mark cases in London boroughs
+london <- c("barking_and_dagenham","barnet","camden","camden_islington","ealing",
+           "enfield","hackney","hammersmith_and_fulham","harrow","hillingdon",
+           "kensington_and_chelsea","kingston","lambeth","lewisham","london_borough_of_lewisham",
+           "london_borough_of_richmond","london_borough_of_sutton","merton","southwark",
+           "tower_hamlets","waltham_forest","wandsworth"
+           )
+sporadic$london <- sporadic$local_authority %in% london
+
+## Check how many ICU admissions in CHESS after start_date_chess
+midpoint = function(agegp) {
+  ifelse(grepl("_",agegp),
+         strsplit(agegp,"_")[[1]] %>% as.numeric %>% mean, 
+         agegp %>% as.numeric)
+}
+chess_icu <- chess %>%
+  filter(admissions>0 & facility=="icu" & type_case=="covid19") %>%
+  mutate(age_class2 = ifelse(age_class == "85", "85_100", age_class %>% as.character)) %>%
+  mutate(age_class2 = ifelse(age_class == "0", "0_1", age_class %>% as.character)) %>%
+  mutate(age = age_class2 %>% as.character %>% sapply(midpoint) %>% round)
+
+## Calculate multipliers
+## Average of ratio of symptomatic cases:cases needing critical care 
+## weighted by age distribution of ICU cases in FF100. 
+## Assumes all ICU cases tested with 100% sensitivity
+## CHESS is only for England so multiply up further by pop UK:pop Eng = 
+
+UK_Eng_ratio <- 66.44/55.98
+calc_mult <- function(data_table, mult_col){ 
+  data_table %>% 
+    mutate(mult1 = 1/mult_col[age+1]) %>%
+    summarise(mean(mult1)) %>%
+    magrittr::extract2(1)
+}
+mult_ff100_low <- (1:ncol(infect_to_icu$low)) %>% 
+  sapply(function(i) calc_mult(sporadic, infect_to_icu$low[,i]))
+mult_ff100_high <- (1:ncol(infect_to_icu$high)) %>% 
+  sapply(function(i) calc_mult(sporadic, infect_to_icu$high[,i]))
+mult_chess_low <- (1:ncol(infect_to_icu$high)) %>% 
+  sapply(function(i) calc_mult(chess_icu, infect_to_icu$low[,i])) %>%
+  magrittr::multiply_by(UK_Eng_ratio)
+mult_chess_high <- (1:ncol(infect_to_icu$high)) %>% 
+  sapply(function(i) calc_mult(chess_icu, infect_to_icu$high[,i])) %>%
+  magrittr::multiply_by(UK_Eng_ratio)
+nmults <- length(mult_ff100_low)
+
+mult_ff100_high %>% quantile(c(0.5, 0.025, 0.975))
+mult_ff100_low %>% quantile(c(0.5, 0.025, 0.975))
+mult_chess_high %>% quantile(c(0.5, 0.025, 0.975))
+mult_chess_low %>% quantile(c(0.5, 0.025, 0.975))
+```
+
+## Deprecated: Multipliers from Imperial (from Roz)
+
+```{r imperial_multipliers}
+# Imperial pyramid data
+prop_icu <- list(
+  min_age = c(0,11,21,31,41,51,61,71,80,100),
+  prop_case_hosp=c(0.003577286,0.005106698,0.01593046,0.035490192,
+                   0.059805606,0.148657251,0.3408562,0.548488756,0.663526952),
+  prop_hosp_icu=c(0.027272727,0.027272727,0.027272727,0.027272727,0.028309001,
+                  0.053001642,0.073746179,0.122700341,0.15)
+)
+prop_icu$prop_case_icu <- prop_icu$prop_case_hosp * prop_icu$prop_hosp_icu
+prop_icu$mult_icu_case <- 1/prop_icu$prop_case_icu
+
+# FF100 multiplier
+ff100.icu <- sporadic %>%
+  filter(!gp & !is.na(age)) %>%
+  select(age) %>%
+  mutate(agegp = cut(x = age, breaks = prop_icu$min_age,
+                       include.lowest = T, right = F),
+         mult_icu_case = cut(x = age, breaks = prop_icu$min_age, 
+                             labels = prop_icu$mult_icu_case,
+                             include.lowest = T, right = F)
+)
+mult_ff100 <- ff100.icu$mult_icu_case %>% as.character %>% as.numeric %>% mean
+
+# CHESS data
+
+start_date_chess <- as.Date("2020-03-15")
+chess_icu_age <- chess %>%
+  filter(admissions>0 & facility=="icu" & type_case=="covid19" & 
+           date_admission >= start_date_chess) %>%
+  select(age_class, admissions) %>%
+  mutate(age = age_class %>% as.character %>% sapply(midpoint)) %>%
+  group_by(age) %>%
+  summarise(n = sum(admissions)) %>%
+  mutate(mult_case = cut(x = age, breaks = prop_icu$min_age, 
+                             labels = prop_icu$mult_icu_case,
+                             include.lowest = T, right = F))
+mult_chess <- sum((chess_icu_age$mult_case %>% as.character %>% as.numeric) 
+                  * chess_icu_age$n)/sum(chess_icu_age$n)
+```
+
+## Poisson model fitting
+
+```{r fit_poisson_model}
+
+## Graph range: 16 Feb (first onset date for ICU case in FF100) to 23 March (day of lockdown)
+today <- Sys.Date()
+start_date <- as.Date("2020-02-16")
+end_date <- as.Date("2020-03-23")
+t_range_all <- seq.Date(start_date, end_date, by = "day")
+t_range_ff100 <- seq.Date(start_date, as.Date("2020-03-06"), by = "day") #Drop last few days when FF100 is declining
+t_range_ff100_full <- seq.Date(start_date, as.Date("2020-03-15"), by = "day")
+t_range_chess <- seq.Date(as.Date("2020-03-15"), as.Date("2020-03-20"), by = "day")
+
+## Construct subsets of FF100 ICU cases
+ff100_all <- sporadic %>% 
+  filter(date_onset2 %in% t_range_ff100) %>%
+  group_by(date_onset2) %>% 
+  summarise(n = n()) %>%
+  complete(date_onset2 = t_range_ff100, fill = list(n = 0))
+ff100_nogp <- sporadic %>% 
+  filter(date_onset2 %in% t_range_ff100) %>%
+  filter(!gp) %>%
+  group_by(date_onset2) %>% 
+  summarise(n = n()) %>%
+  complete(date_onset2 = t_range_ff100, fill = list(n = 0))
+ff100_ldn <- sporadic %>% 
+  filter(date_onset2 %in% t_range_ff100) %>%
+  filter(london) %>%
+  group_by(date_onset2) %>% 
+  summarise(n = n()) %>%
+  complete(date_onset2 = t_range_ff100, fill = list(n = 0))
+chess_icu_all <- chess_icu %>%
+  filter(date_admission %in% t_range_chess) %>%
+  group_by(date_admission) %>%
+  summarise(n = sum(admissions))
+
+## Model with time delays
+lambda <- function(A = 1, B = 0.05, delay_model_out = MC_delay$model[,1]){
+
+  f_cases <- function(t) A*exp(B*t) 
+  f_delay <- function(t) c(delay_model_out,rep(0,100))[t+1]
+
+  days <- (t_range_all - start_date) %>% as.numeric #days after start_date
+  cases <- f_cases(days)
+  delay <- days %>% sapply(f_delay) %>% unlist
+  cases_delay <- rep(0,max(days)+1)
+  for(t in days){
+    cases_delay[t:max(days) + 1] <- cases_delay[t:max(days) + 1] + 
+      f_cases(t) * f_delay(0:(max(days)-t))
+  }
+  
+  return(list(cases = cases, delay = delay, cases_delay = cases_delay))
+}
+
+## Log-Likelihood function
+NLL <- function(AB, ff100_table = ff100_all, chess_table = chess_icu_all, mults, 
+                ff100_like = TRUE, chess_like = TRUE, delay_model_out = MC_delay$model[,1],
+                t_range_ff100_lambda = t_range_ff100){
+
+  #FF100 gives date of onset, so fit cases without delay
+  #CHESS gives date of admission, so fit cases with delay
+  #CHESS cases are drawn from a process with mult_ff100/mult_chess the speed
+
+	model_cases_ff100 <- 
+	  lambda(A = AB[1], B = AB[2], delay_model_out = delay_model_out)$
+	  cases[as.numeric(t_range_ff100 - start_date + 1)]
+	model_cases_chess <- 
+	  lambda(A = AB[1] * mults$ff100/mults$chess, B = AB[2], delay_model_out = delay_model_out)$
+	  cases_delay[as.numeric(t_range_chess - start_date + 1)]
+
+	llike <- 0
+  if(ff100_like == TRUE) llike <- llike + sum(dpois(ff100_table$n, model_cases_ff100, log = T))
+  if(chess_like == TRUE) llike <- llike + sum(dpois(chess_table$n, model_cases_chess, log = T))
+	return(-llike)
+}
+
+## Monte Carlo sampling by importance sampling resampling to find A,B posterior distribution
+# systematic resampling
+ISR_montecarlo <- function(ff100_table, chess_table,mults, 
+                           ff100_like = TRUE, chess_like = TRUE,
+                           t_range_ff100_lambda = t_range_ff100,
+                           rmax = list(A = 1, B = 1)){
+  
+  nsamples <- 10000
+  mc <- list()
+#  LatinHyper <- randomLHS(nsamples,4)
+#  mc$A <- LatinHyper[,1] * rmax$A
+#  mc$B <- LatinHyper[,2] * rmax$B
+#  mc$m <- (LatinHyper[,3]*nmults) %>% ceiling #multipler scenario; integer from 1-1000
+#  mc$d <- (LatinHyper[,4]*ndelay) %>% ceiling #delay distribution scenario; integer from 1-1000
+  
+  mc$A <- runif(nsamples, min=0, max=1)    #A in Aexp(Bt)
+  mc$B <- runif(nsamples, min=0, max=1)    #B in Aexp(Bt)
+  mc$m <- runif(nsamples, min=0.51, max=nmults) %>% round #multiplier scenario
+  mc$d <- runif(nsamples, min=0.51, max=ndelay) %>% round #mdelay distribution scenario
+  mc$NLL <- apply(cbind(mc$A, mc$B, mc$m), 1,
+    function(x) NLL(AB = x[1:2], ff100_table = ff100_table, chess_table = chess_table, 
+                    mults = list(ff100 = mults$ff100[x[3]], chess = mults$chess[x[3]]), 
+                    ff100_like = ff100_like, chess_like = chess_like,
+                    delay_model_out = MC_delay$model[,MC_delay$ISR[mc$d]],
+                    t_range_ff100_lambda = t_range_ff100)
+  )
+
+  mc$A <- mc$A[order(mc$NLL)]
+  mc$B <- mc$B[order(mc$NLL)]
+  mc$m <- mc$m[order(mc$NLL)]
+  mc$NLL <- mc$NLL[order(mc$NLL)]
+  mc$MLE <- mc$NLL %>% which.min
+  mc$ISR <- sample.int(nsamples, size=nsamples, replace=T, prob = exp(-mc$NLL)) %>% sort
+  return(mc)
+  
+}
+
+## Matrix of cases by day
+f_predicted_cases <- function(mc, mults){
+  dates <- t_range_all
+  cases_by_day <- matrix(nrow = length(t_range_all), ncol = length(mc$ISR))
+  rownames(cases_by_day) <- as.character(dates)
+  colnames(cases_by_day) <- mc$ISR
+  cases_by_day_delay <- cases_by_day
+  icu_by_day <- cases_by_day
+  for(i in 1:length(mc$ISR)){
+    lambda_i <- lambda(A = mc$A[mc$ISR[i]], B = mc$B[mc$ISR[i]])
+    icu_by_day[,i] <- lambda_i$cases_delay
+    cases_by_day[,i] <- lambda_i$cases * mults$ff100[mc$m[MC$ISR[i]]]
+    cases_by_day_delay[,i] <- lambda_i$cases_delay *  mults$ff100[mc$m[mc$ISR[i]]]
+  }
+  return(list(icu_by_day = icu_by_day, 
+              cases_by_day = cases_by_day, 
+              cases_by_day_delay = cases_by_day_delay,
+              MLE = mc$MLE))
+}
+
+```
+
+## Graphs
+
+# Graph function
+
+```{r poisson_graph_function}
+
+#Draw relevant lines on graph
+graph <- function(cases_table, mult_data, predicted_cases, 
+                  end_date_graph = as.Date("2020-03-23"), data_label){
+
+  par(mar=c(4,4,1,4)+.1)
+  t_range_graph <- seq.Date(start_date, end_date_graph, by = "day")
+  ymax <- max(
+    predicted_cases$cases_by_day[rownames(predicted_cases$cases_by_day)==end_date_graph,1],
+    max(cases_table[,2] * mult_data))
+  plot(1, type = "n",
+       xlim = c(start_date, end_date_graph), ylim=c(0,ymax), 
+       axes = F, xlab = "Date", ylab = "Daily incidence (thousands)")
+  axis(1, at = t_range_graph, labels = format(t_range_graph, "%d-%b"))
+  axis(2, at = pretty(0:ymax), labels = pretty(0:ymax)/10^3)
+  axis(4, at = pretty(0:ymax/mult_data)*mult_data, labels = pretty(0:ymax/mult_data))
+  mtext("Daily CC reports", side = 4, line = 2)
+
+  #Data on CC cases
+  for(b in 1:nrow(cases_table)){
+    bp.x = cases_table[b,1]
+    bp.y = cases_table[b,2] * mult_data
+    rect(xleft = bp.x-0.5, xright = bp.x+0.5, ybottom = 0, ytop = bp.y, 
+         col = my_blue, border = F)
+  }
+
+  #Good fitting curves
+  pred_cases_x <- predicted_cases$cases_by_day %>% rownames %>% as.Date
+  pred_cases_u <- predicted_cases$cases_by_day %>% apply(1,function(x) quantile(x, c(0.975)))
+  pred_cases_l <- predicted_cases$cases_by_day %>% apply(1,function(x) quantile(x, c(0.025)))
+  polygon(x = c(pred_cases_x, rev(pred_cases_x)), 
+          y = c(pred_cases_l, rev(pred_cases_u)), 
+          col = my_green_t, border = NA)
+  
+  pred_cases_delay_x <- predicted_cases$cases_by_day_delay %>% rownames %>% as.Date
+  pred_cases_delay_u <- predicted_cases$cases_by_day_delay %>% 
+    apply(1,function(x) quantile(x, c(0.975)))
+  pred_cases_delay_l <- predicted_cases$cases_by_day_delay %>% 
+    apply(1,function(x) quantile(x, c(0.025)))
+  polygon(x = c(pred_cases_delay_x, rev(pred_cases_delay_x)), 
+          y = c(pred_cases_delay_l, rev(pred_cases_delay_u)), 
+          col = my_red_t, border = NA)
+
+  #MLE curve
+  lines(x = predicted_cases$cases_by_day_delay %>% rownames %>% as.Date, 
+        y = predicted_cases$cases_by_day_delay[,predicted_cases$MLE], col = my_red, lwd = 2)
+  lines(x = predicted_cases$cases_by_day %>% rownames %>% as.Date, 
+        y = predicted_cases$cases_by_day[,predicted_cases$MLE], col = my_green, lwd = 2)
+  
+  legend("topleft", 
+         legend = c(paste(data_label, "(right-hand axis)"),
+                    "Model: new CC reports (95% CrI)",
+                    "Model: new CC reports (MLE)",
+                    "Model: new infections (95% CrI)",
+                    "Model: new infections (MLE)"),
+         bty = "n", lty =c(0,1,1,1,1), lwd = c(0,10,1,10,1), pch = c(15,NA,NA,NA,NA), 
+         col = c(my_blue, my_red_t, my_red, my_green_t, my_green)
+  )
+  
+  abline(v=Sys.Date(), lty="dashed")
+  box()
+  
+}
+```
+
+# Using both FF100 and CHESS
+
+```{r poisson_graph_ff100chess}
+mults_low <- list(ff100 = mult_ff100_low, chess = mult_chess_low)
+MC <- ISR_montecarlo(ff100_table = ff100_all, chess_table = chess_icu_all, mults_low)
+predicted_cases <- f_predicted_cases(MC,mults)
+
+layout(matrix(c(1,2), 2, 1))
+graph(cases_table = ff100_all, 
+      mult_data = mults$ff100[MC$m[MC$ISR]] %>% mean, 
+      predicted_cases = predicted_cases,
+      end_date_graph = as.Date("2020-03-12"), data_label = "CC admissions (FF100)")
+graph(cases_table = chess_icu_all, 
+      mult_data = mults$chess[MC$m[MC$ISR]] %>% mean, 
+      predicted_cases = predicted_cases,
+      end_date_graph = as.Date("2020-03-23"), data_label = "CC admissions (CHESS)")
+```
+
+# Using only CHESS
+
+```{r poisson_graph_chess}
+MC_chess <- ISR_montecarlo(ff100_table = ff100_all, chess_table = chess_icu_all, mults_low, ff100_like = F)
+predicted_cases_chess <- f_predicted_cases(MC_chess,mults)
+layout(matrix(c(1,2), 2, 1))
+graph(cases_table = ff100_all, 
+      mult_data = mults$ff100[MC$m[MC$ISR]] %>% mean, 
+      predicted_cases = predicted_cases_chess, 
+      end_date_graph = as.Date("2020-03-12"), data_label = "CC admissions (FF100)")
+graph(cases_table = chess_icu_all, 
+      mult_data = mults$chess[MC$m[MC$ISR]] %>% mean, 
+      predicted_cases = predicted_cases_chess,
+      end_date_graph = as.Date("2020-03-23"), data_label = "CC admissions (CHESS)")
+
+```
+
+# Using CDC high scenario
+
+```{r poisson_graph_ff100chess_highmul}
+mults_high <- list(ff100 = mult_ff100_high, chess = mult_chess_high)
+MC_high <- ISR_montecarlo(ff100_table = ff100_all, chess_table = chess_icu_all, mults_high)
+predicted_cases_high <- f_predicted_cases(MC_high, mults_high)
+pred_cases_high <- predicted_cases_high$cases_by_day
+pred_cases_delay_high <- predicted_cases_high$cases_by_day_delay
+pred_cases_icu_high <- predicted_cases_high$icu_by_day
+```
+
+# Assuming 4/3 times more reported cases
+
+```{r poisson_graph_ff100chess_double}
+MC_double <- ISR_montecarlo(ff100_table = ff100_all %>% mutate(n=round(4/3*n)), 
+                     chess_table = chess_icu_all %>% mutate (n=round(4/3*n)), mults_low)
+predicted_cases_double <- f_predicted_cases(MC_double, mults)
+```
+
+# Use full FF100 range
+```{r poisson_graph_ff100chess_fullrange}
+MC_ff100full <- ISR_montecarlo(ff100_table = ff100_all, chess_table = chess_icu_all, mults_low, t_range_ff100 = t_range_ff100_full)
+predicted_cases_ff100full <- f_predicted_cases(MC_ff100full,mults)
+```
+
+
+## Summary table
+
+```{r summary}
+
+quantile95 <- function(x) quantile(x, c(0.5,0.025,0.975))
+out_scenarios <- list(predicted_cases, 
+                  predicted_cases_chess, 
+                  predicted_cases_double,
+                  predicted_cases_ff100full,
+                  predicted_cases_high)
+out_MC_scenarios <- list(MC, 
+                  MC_chess, 
+                  MC_double,
+                  MC_ff100full,
+                  MC_high)
+out_names <- c("base","chess","double","full_ff100","CDClow")
+
+#cases on 23 March
+f_out_cases <- function(predicted_cases){
+  predicted_cases$cases_by_day[rownames(predicted_cases$cases_by_day) == "2020-03-23",] %>%
+  quantile95
+}
+out_cases <- out_scenarios %>% 
+  sapply(f_out_cases) %>%
+  signif(3) %>% magrittr::divide_by(1000) %>% t
+
+#total cases
+f_out_total_cases <- function(predicted_cases){
+  predicted_cases$cases_by_day %>%
+    apply(2,sum) %>%
+    quantile95
+}
+out_total_cases <- out_scenarios %>% 
+  sapply(f_out_total_cases) %>%
+  signif(3) %>% magrittr::divide_by(1000) %>% t
+
+#growth
+f_out_doubling <- function(MC){
+  log(2)/MC$B[MC$ISR] %>%
+    quantile95
+}
+out_doubling <- out_MC_scenarios %>% 
+  sapply(f_out_doubling) %>%
+  signif(3) %>% t
+
+#Reproductiob number
+f_out_Rt <- function(MC){
+  MC$B[MC$ISR] %>%
+    quantile95 %>%
+    magrittr::multiply_by(4) %>%
+    magrittr::add(1)
+}
+out_Rt <- out_MC_scenarios %>% 
+  sapply(f_out_Rt) %>%
+  signif(3) %>% t
+
+#Output for paper
+out_formatted <- cbind(
+  frmtci(out_cases, digits = 0, show_level = FALSE),
+  frmtci(out_total_cases, digits = 0, show_level = FALSE),
+  frmtci(out_doubling, digits = 2, show_level = FALSE)
+) %>%
+  magrittr::set_rownames(out_names) %>%
+  magrittr::set_colnames(c("New infections","Cumulative infections","Doubling time"))
+write.csv(out_formatted,"clipboard")
+
+#IC reports
+f_out_CC <- function(predicted_cases){
+  predicted_cases$icu_by_day[rownames(predicted_cases$icu_by_day) == "2020-03-23",] %>%
+  quantile95
+}
+f_out_CC(predicted_cases)
+
+#total ICU admissions: total and in last 8 days
+f_out_total_CC <- function(predicted_cases, from = start_date, to = end_date ){
+  predicted_cases$icu_by_day[
+    rownames(predicted_cases$icu_by_day) >= from &
+      rownames(predicted_cases$icu_by_day) <= to,] %>%
+    apply(2, sum) %>%
+    quantile95
+}
+f_out_total_CC(predicted_cases)
+f_out_total_CC(predicted_cases, from = "2020-03-16")
+```
+
+
+## Results (SPI-M)
+
+Output .csv file in the format needed for SPI-M
+
+```{r results_spi-m}
+
+spim <- data.frame(
+  Group = "LSHTM", 
+  Scenario = "Forecast",
+  CreationDay = format(today, "%d"),
+  CreationMonth = format(today, "%m"),
+  CreationYear = format(today, "%Y"),
+  DayOfValue = predicted_cases$cases_by_day_delay %>% rownames %>% as.Date %>% format("%d"),
+  MonthOfValue = predicted_cases$cases_by_day_delay %>% rownames %>% as.Date %>% format("%m"),
+  YearOfValue = predicted_cases$cases_by_day_delay %>% rownames %>% as.Date %>% format("%Y"),
+  Geography = "England",
+  ValueType = "case_onsets",
+  Value = predicted_cases$cases_by_day_delay[,1],
+  Centile1 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.01)),
+  Centile5 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.05)),
+  Centile25 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.25)),
+  Centile75 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.75)),
+  Centile95 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.95)),
+  Centile99 = predicted_cases$cases_by_day_delay %>% apply(1, function(x) quantile(x,0.99))
+)
+
+write.csv(spim, "clipboard", row.names=F)
+
+```
+
+
+
+
+
+
+<!-- =======================================================  -->
+<!-- =======================================================  -->
+<!-- ======================================================= -->
+
+# System information {.tabset .tabset-fade .tabset-pills}
+
+## Outline
+
+The following information documents the system on which the document was
+compiled.
+
+
+## System 
+
+This provides information on the operating system.
+
+```{r system_info}
+Sys.info()
+```
+
+## R environment
+
+This provides information on the version of R used:
+
+```{r R_session}
+R.version
+```
+
+
+## R packages
+
+This provides information on the packages used:
+
+```{r R_pkg}
+sessionInfo()
+```
