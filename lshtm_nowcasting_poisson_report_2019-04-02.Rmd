@@ -1,6 +1,6 @@
 ---
 title: "LSHTM nowcasting UK report (Poisson model)"
-author: "Mark, Thibaut, Emily, CMMID, John"
+author: "Mark, Thibaut, Emily, Joel, CMMID, John"
 date: "`r format(Sys.time(), '%A %d %B %Y')`"
 output:
   html_document:
